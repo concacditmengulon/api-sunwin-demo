@@ -4,8 +4,8 @@
  * Endpoint: GET /api/predict
  * Trả về:
  * {
- *   id: "Tele@idol_vannhat",
- *   Phien_truoc, Phien_sau, Xuc_xac, Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
+ * id: "Tele@idol_vannhat",
+ * Phien_truoc, Phien_sau, Xuc_xac, Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
  * }
  */
 
@@ -244,9 +244,9 @@ function mauCau15Predict() {
   }
 
   // Phát hiện mẫu bậc thang
-  let stair = 0; // Khởi tạo stair để tránh lỗi
-  const last8 = seq.slice(-8).length >= 8 ? seq.slice(-8) : [];
-  if (last8.length >= 3) {
+  let stair = 0;
+  const last8 = seq.slice(-8);
+  if (last8.length >= 8) {
     for (let i = 2; i < last8.length; i++) {
       if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
     }
@@ -332,6 +332,15 @@ function finalPredict() {
   const pro = aiProAnalyzer(history);
   const mc15 = mauCau15Predict();
   const dice = diceAnalyzer(history);
+
+  // Khai báo biến `stair` ở đầu hàm
+  let stair = 0;
+  const last8 = history.slice(-8).map((x) => x.result);
+  if (last8.length >= 3) {
+    for (let i = 2; i < last8.length; i++) {
+      if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
+    }
+  }
 
   // Trọng số động
   const weights = modelWeights;
