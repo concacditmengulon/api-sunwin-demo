@@ -4,10 +4,10 @@
  * Endpoint: GET /api/custom
  * Trả về:
  * {
- *   id: "Tele@idol_vannhat",
- *   Phien_truoc, Phien_sau,
- *   Xuc_xac: [x1,x2,x3],
- *   Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
+ * id: "Tele@idol_vannhat",
+ * Phien_truoc, Phien_sau,
+ * Xuc_xac: [x1,x2,x3],
+ * Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
  * }
  */
 
@@ -23,7 +23,9 @@ const SOURCE_API = "https://sunai.onrender.com/api/taixiu/history";
 let history = [];            // [{session, dice:[a,b,c], total, result}]
 let patternMemory = {};      // n-gram 'T'/'X' -> đếm tần suất tiếp theo
 let modelPredictions = {};   // {session: {module: "Tài"/"Xỉu", ... , final}}
+let predictionsHistory = []; // {session, du_doan, ket_qua, do_tin_cay, danh_gia}
 const MAX_HISTORY = 400;
+const MAX_PREDICTIONS_HISTORY = 200;
 
 // ============= Tiện ích chung =============
 const r01 = (x) => Math.round(x * 100) / 100;
@@ -401,6 +403,23 @@ function finalPredict() {
     mau15: mc15.pred || "None",
     final: pred
   };
+  
+  // Ghi lại lịch sử dự đoán mới
+  const latestPrediction = {
+    Phien_truoc: curSession,
+    Du_doan: pred,
+    Ket_qua: history.at(-1).result,
+    Do_tin_cay: r01(conf),
+    Danh_gia: pred === history.at(-1).result ? "ĐÚNG✅" : "SAI❌"
+  };
+
+  const seen = new Set(predictionsHistory.map(p => p.Phien_truoc));
+  if (!seen.has(curSession)) {
+    predictionsHistory.push(latestPrediction);
+    if (predictionsHistory.length > MAX_PREDICTIONS_HISTORY) {
+        predictionsHistory = predictionsHistory.slice(-MAX_PREDICTIONS_HISTORY);
+    }
+  }
 
   const explain = [
     `PRO(${pro.reason})`,
@@ -455,6 +474,10 @@ app.get("/debug/pattern", (_req, res) => res.json(patternMemory));
 app.get("/debug/predict_modules", (_req, res) => {
   const cur = history.at(-1)?.session;
   res.json({ session: cur, modules: modelPredictions[cur] || null });
+});
+// Endpoint mới
+app.get("/debug/lichsu-dudoan", (_req, res) => {
+  res.json(predictionsHistory);
 });
 
 app.listen(PORT, () => {
