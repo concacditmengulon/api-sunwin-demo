@@ -1,396 +1,425 @@
-// server.js
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const fetch = require('node-fetch');
+/**
+ * API Taixiu SIÊU VIP – by Tele@idol_vannhat
+ * Node >= 18 (có fetch sẵn)
+ * Endpoint chính: GET /api/custom
+ * Trả về:
+ * {
+ *   id: "Tele@idol_vannhat",
+ *   Phien_truoc, Phien_sau,
+ *   Xuc_xac: [x1,x2,x3],
+ *   Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
+ * }
+ */
+
+import express from "express";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_URL = "https://toilavinhmaycays23.onrender.com/vinhmaycay";
 
-// Middleware
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+// API nguồn (trả lịch sử nhiều phiên, phần tử [0] thường là mới nhất)
+const SOURCE_API = "https://sunai.onrender.com/api/taixiu/history";
 
-// ==================== THUẬT TOÁN DỰ ĐOÁN ====================
-// --- Dán toàn bộ các hàm JavaScript của bạn vào đây ---
-// (Ví dụ đã được cung cấp ở câu trả lời trước, bạn chỉ cần dán vào)
+// ====== Bộ nhớ tạm thời trên server (in-memory) ======
+let history = [];            // [{session, dice:[a,b,c], total, result}]
+let patternMemory = {};      // n-gram cho chuỗi 'T'/'X' -> đếm tần suất tiếp theo
+let modelPredictions = {};   // lưu dự đoán theo session để chấm hiệu năng
+const MAX_HISTORY = 300;
 
-function detectStreakAndBreak(history) {
-    if (!history || history.length === 0) {
-        return { streak: 0, currentResult: null, breakProb: 0 };
-    }
-    let streak = 1;
-    const currentResult = history[history.length - 1].result;
-    for (let i = history.length - 2; i >= 0; i--) {
-        if (history[i].result === currentResult) streak++;
-        else break;
-    }
-    const last15Results = history.slice(-15).map(item => item.result);
-    if (!last15Results.length) {
-        return { streak, currentResult, breakProb: 0 };
-    }
-    const switches = last15Results.slice(1).reduce((count, result, index) => {
-        return count + (result !== last15Results[index] ? 1 : 0);
-    }, 0);
-    const taiCount = last15Results.filter(result => result === 'Tài').length;
-    const xiuCount = last15Results.length - taiCount;
-    const imbalance = Math.abs(taiCount - xiuCount) / last15Results.length;
-    let breakProb = 0;
-    if (streak >= 8) {
-        breakProb = Math.min(0.6 + switches / 15 + imbalance * 0.15, 0.9);
-    } else if (streak >= 5) {
-        breakProb = Math.min(0.35 + switches / 10 + imbalance * 0.25, 0.85);
-    } else if (streak >= 3 && switches >= 7) {
-        breakProb = 0.3;
-    }
-    return { streak, currentResult, breakProb };
+// ====== Tiện ích ======
+const r01 = (x) => Math.round(x * 100) / 100;
+const last = (arr, k = 1) => arr.slice(-k);
+const toTX = (res) => (res === "Tài" ? "T" : "X");
+
+// ====== Nạp dữ liệu từ API nguồn & chuẩn hóa ======
+async function loadSource() {
+  const resp = await fetch(SOURCE_API, { cache: "no-store" });
+  const data = await resp.json();
+
+  // Kỳ vọng data là mảng các bản ghi có {session, dice, total, result}
+  // Nếu API trả khác, bạn có thể chỉnh map ở đây.
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("API nguồn không trả mảng dữ liệu hợp lệ");
+  }
+
+  // Chuẩn hóa + sort theo session tăng dần
+  const norm = data
+    .filter(x => x && typeof x.session !== "undefined")
+    .map(x => ({
+      session: Number(x.session),
+      dice: Array.isArray(x.dice) ? x.dice.map(Number) : [0, 0, 0],
+      total: Number(x.total ?? 0),
+      result: x.result === "Tài" || x.result === "Xỉu"
+        ? x.result
+        : (Number(x.total ?? 0) >= 11 ? "Tài" : "Xỉu")
+    }))
+    .sort((a, b) => a.session - b.session);
+
+  // Gộp vào history, tránh trùng lặp
+  const seen = new Set(history.map(h => h.session));
+  for (const row of norm) {
+    if (!seen.has(row.session)) history.push(row);
+  }
+  if (history.length > MAX_HISTORY) {
+    history = history.slice(-MAX_HISTORY);
+  }
+
+  // Cập nhật patternMemory từ chuỗi Mau_cau
+  rebuildPatternMemory();
 }
 
-let modelPredictions = {};
+// ====== Xây dựng bộ nhớ mẫu cầu (n-gram) ======
+function rebuildPatternMemory() {
+  patternMemory = {};
+  const seq = history.map(h => toTX(h.result)); // chuỗi 'T'/'X'
+  const N = seq.length;
 
-function evaluateModelPerformance(history, modelName, lookback = 10) {
-    if (!modelPredictions[modelName] || history.length < 2) return 1;
-    lookback = Math.min(lookback, history.length - 1);
-    let correctPredictions = 0;
-    for (let i = 0; i < lookback; i++) {
-        const sessionId = history[history.length - (i + 2)].session;
-        const prediction = modelPredictions[modelName][sessionId] || 0;
-        const actualResult = history[history.length - (i + 1)].result;
-        if ((prediction === 1 && actualResult === 'Tài') ||
-            (prediction === 2 && actualResult === 'Xỉu')) {
-            correctPredictions++;
-        }
+  // Dùng n-gram với n = 3,4,5 để bắt mẫu cầu dài/ngắn
+  const ns = [3, 4, 5];
+  for (const n of ns) {
+    for (let i = 0; i <= N - (n + 1); i++) {
+      const key = seq.slice(i, i + n).join("");      // n ký tự
+      const nxt = seq[i + n];                        // ký tự tiếp theo
+      if (!patternMemory[n]) patternMemory[n] = {};
+      if (!patternMemory[n][key]) patternMemory[n][key] = { T: 0, X: 0 };
+      patternMemory[n][key][nxt]++;
     }
-    const performanceRatio = lookback > 0 ?
-        1 + (correctPredictions - lookback / 2) / (lookback / 2) : 1;
-    return Math.max(0.5, Math.min(1.5, performanceRatio));
+  }
 }
 
-function smartBridgeBreak(history) {
-    if (!history || history.length < 3) {
-        return { prediction: 0, breakProb: 0, reason: 'Không đủ dữ liệu để bẻ cầu' };
-    }
-    const { streak, currentResult, breakProb } = detectStreakAndBreak(history);
-    const last20Results = history.slice(-20).map(item => item.result);
-    const last20Scores = history.slice(-20).map(item => item.score || 0);
-    let finalBreakProb = breakProb;
-    let reason = '';
-    const avgScore = last20Scores.reduce((sum, score) => sum + score, 0) / (last20Scores.length || 1);
-    const scoreDeviation = last20Scores.reduce((sum, score) => sum + Math.abs(score - avgScore), 0) / (last20Scores.length || 1);
-    const last5Results = last20Results.slice(-5);
-    const patternCounts = {};
-    for (let i = 0; i <= last20Results.length - 3; i++) {
-        const pattern = last20Results.slice(i, i + 3).join(',');
-        patternCounts[pattern] = (patternCounts[pattern] || 0) + 1;
-    }
-    const mostCommonPattern = Object.entries(patternCounts).sort((a, b) => b[1] - a[1])[0];
-    const hasRepeatingPattern = mostCommonPattern && mostCommonPattern[1] >= 3;
-    if (streak >= 6) {
-        finalBreakProb = Math.min(finalBreakProb + 0.15, 0.9);
-        reason = `[Bẻ Cầu] Chuỗi ${streak} ${currentResult} dài, khả năng bẻ cầu cao`;
-    } else if (streak >= 4 && scoreDeviation > 3) {
-        finalBreakProb = Math.min(finalBreakProb + 0.1, 0.85);
-        reason = `[Bẻ Cầu] Biến động điểm số lớn (${scoreDeviation.toFixed(1)}), khả năng bẻ cầu tăng`;
-    } else if (hasRepeatingPattern && last5Results.every(result => result === currentResult)) {
-        finalBreakProb = Math.min(finalBreakProb + 0.05, 0.8);
-        reason = `[Bẻ Cầu] Phát hiện mẫu lặp ${mostCommonPattern[0]}, có khả năng bẻ cầu`;
-    } else {
-        finalBreakProb = Math.max(finalBreakProb - 0.15, 0.15);
-        reason = '[Bẻ Cầu] Không phát hiện mẫu bẻ cầu mạnh, tiếp tục theo cầu';
-    }
-    let prediction = finalBreakProb > 0.65 ?
-        (currentResult === 'Tài' ? 2 : 1) :
-        (currentResult === 'Tài' ? 1 : 2);
-    return { prediction, breakProb: finalBreakProb, reason };
+// ====== Các module phân tích/thuật toán ======
+function detectStreakAndBreak(hist) {
+  if (hist.length === 0) return { streak: 0, current: null, breakProb: 0 };
+
+  let streak = 1;
+  const current = hist[hist.length - 1].result;
+  for (let i = hist.length - 2; i >= 0; i--) {
+    if (hist[i].result === current) streak++;
+    else break;
+  }
+
+  const last20 = hist.slice(-20).map(x => x.result);
+  const switches = last20.slice(1).reduce((c, r, i) => c + (r !== last20[i] ? 1 : 0), 0);
+  const taiCount = last20.filter(r => r === "Tài").length;
+  const xiuCount = last20.length - taiCount;
+  const imb = last20.length ? Math.abs(taiCount - xiuCount) / last20.length : 0;
+
+  let breakProb = 0;
+  if (streak >= 9) breakProb = Math.min(0.7 + switches / 20 + imb * 0.2, 0.95);
+  else if (streak >= 6) breakProb = Math.min(0.45 + switches / 15 + imb * 0.3, 0.9);
+  else if (streak >= 4 && switches >= 9) breakProb = 0.4;
+
+  // entropy đơn giản
+  const pT = taiCount / (last20.length || 1);
+  const pX = 1 - pT;
+  const entropy = -(pT ? pT * Math.log2(pT) : 0) - (pX ? pX * Math.log2(pX) : 0);
+  if (entropy < 0.8) breakProb += 0.1;
+
+  return { streak, current, breakProb: Math.min(breakProb, 1) };
 }
 
-function trendAndProb(history) {
-    if (!history || history.length < 3) return 0;
-    const { streak, currentResult, breakProb } = detectStreakAndBreak(history);
-    if (streak >= 5) {
-        if (breakProb > 0.75) return currentResult === 'Tài' ? 2 : 1;
-        return currentResult === 'Tài' ? 1 : 2;
-    }
-    const last15Results = history.slice(-15).map(item => item.result);
-    if (!last15Results.length) return 0;
-    const weightedResults = last15Results.map((result, index) => Math.pow(1.2, index));
-    const taiWeight = weightedResults.reduce((sum, weight, i) => sum + (last15Results[i] === 'Tài' ? weight : 0), 0);
-    const xiuWeight = weightedResults.reduce((sum, weight, i) => sum + (last15Results[i] === 'Xỉu' ? weight : 0), 0);
-    const totalWeight = taiWeight + xiuWeight;
-    const last10Results = last15Results.slice(-10);
-    const patterns = [];
-    if (last10Results.length >= 4) {
-        for (let i = 0; i <= last10Results.length - 4; i++) {
-            patterns.push(last10Results.slice(i, i + 4).join(','));
-        }
-    }
-    const patternCounts = patterns.reduce((counts, pattern) => {
-        counts[pattern] = (counts[pattern] || 0) + 1;
-        return counts;
-    }, {});
-    const mostCommonPattern = Object.entries(patternCounts).sort((a, b) => b[1] - a[1])[0];
-    if (mostCommonPattern && mostCommonPattern[1] >= 3) {
-        const patternParts = mostCommonPattern[0].split(',');
-        return patternParts[patternParts.length - 1] !== last10Results[last10Results.length - 1] ? 1 : 2;
-    }
-    if (totalWeight > 0 && Math.abs(taiWeight - xiuWeight) / totalWeight >= 0.25) {
-        return taiWeight > xiuWeight ? 2 : 1;
-    }
-    return last15Results[last15Results.length - 1] === 'Xỉu' ? 1 : 2;
+function markovTransitionProb(hist) {
+  if (hist.length < 5) return { taiProb: 0.5, xiuProb: 0.5 };
+  const trans = { Tài: { Tài: 0, Xỉu: 0 }, Xỉu: { Tài: 0, Xỉu: 0 } };
+  for (let i = 1; i < hist.length; i++) {
+    trans[hist[i - 1].result][hist[i].result]++;
+  }
+  const cur = hist[hist.length - 1].result;
+  const tot = trans[cur].Tài + trans[cur].Xỉu;
+  if (!tot) return { taiProb: 0.5, xiuProb: 0.5 };
+  return { taiProb: trans[cur].Tài / tot, xiuProb: trans[cur].Xỉu / tot };
 }
 
-function shortPattern(history) {
-    if (!history || history.length < 3) return 0;
-    const { streak, currentResult, breakProb } = detectStreakAndBreak(history);
-    if (streak >= 4) {
-        if (breakProb > 0.75) return currentResult === 'Tài' ? 2 : 1;
-        return currentResult === 'Tài' ? 1 : 2;
-    }
-    const last8Results = history.slice(-8).map(item => item.result);
-    if (!last8Results.length) return 0;
-    const patterns = [];
-    if (last8Results.length >= 3) {
-        for (let i = 0; i <= last8Results.length - 3; i++) {
-            patterns.push(last8Results.slice(i, i + 3).join(','));
-        }
-    }
-    const patternCounts = patterns.reduce((counts, pattern) => {
-        counts[pattern] = (counts[pattern] || 0) + 1;
-        return counts;
-    }, {});
-    const mostCommonPattern = Object.entries(patternCounts).sort((a, b) => b[1] - a[1])[0];
-    if (mostCommonPattern && mostCommonPattern[1] >= 2) {
-        const patternParts = mostCommonPattern[0].split(',');
-        return patternParts[patternParts.length - 1] !== last8Results[last8Results.length - 1] ? 1 : 2;
-    }
-    return last8Results[last8Results.length - 1] === 'Xỉu' ? 1 : 2;
+function smartBridgeBreak(hist) {
+  if (hist.length < 4) return { pred: 0, prob: 0, reason: "Thiếu dữ liệu" };
+  const { streak, current, breakProb } = detectStreakAndBreak(hist);
+  const last25 = hist.slice(-25).map(x => x.result);
+  const scores = hist.slice(-25).map(x => x.total || 0);
+  const avg = scores.reduce((s, v) => s + v, 0) / (scores.length || 1);
+  const varc = scores.reduce((s, v) => s + (v - avg) ** 2, 0) / (scores.length || 1);
+
+  // n-gram 4 trên kết quả Tài/Xỉu
+  const pc = {};
+  for (let i = 0; i <= last25.length - 4; i++) {
+    const k = last25.slice(i, i + 4).join(",");
+    pc[k] = (pc[k] || 0) + 1;
+  }
+  const common = Object.entries(pc).sort((a, b) => b[1] - a[1])[0];
+  const hasRep = common && common[1] >= 4;
+
+  let finalProb = breakProb;
+  let reason = "";
+
+  if (streak >= 7) {
+    finalProb = Math.min(finalProb + 0.2, 0.95);
+    reason = `[Bẻ cầu] Chuỗi ${streak} ${current} dài`;
+  } else if (streak >= 5 && varc > 9) {
+    finalProb = Math.min(finalProb + 0.15, 0.9);
+    reason = `[Bẻ cầu] Biến thiên điểm cao (${r01(varc)})`;
+  } else if (hasRep && last25.slice(-6).every(r => r === current)) {
+    finalProb = Math.min(finalProb + 0.1, 0.85);
+    reason = `[Bẻ cầu] Mẫu lặp mạnh`;
+  } else {
+    finalProb = Math.max(finalProb - 0.1, 0.2);
+    reason = `[Theo cầu] Chưa có tín hiệu bẻ`;
+  }
+
+  const pred = finalProb > 0.7 ? (current === "Tài" ? "Xỉu" : "Tài") : current;
+  return { pred, prob: finalProb, reason };
 }
 
-function meanDeviation(history) {
-    if (!history || history.length < 3) return 0;
-    const { streak, currentResult, breakProb } = detectStreakAndBreak(history);
-    if (streak >= 4) {
-        if (breakProb > 0.75) return currentResult === 'Tài' ? 2 : 1;
-        return currentResult === 'Tài' ? 1 : 2;
-    }
-    const last12Results = history.slice(-12).map(item => item.result);
-    if (!last12Results.length) return 0;
-    const taiCount = last12Results.filter(result => result === 'Tài').length;
-    const xiuCount = last12Results.length - taiCount;
-    const imbalance = Math.abs(taiCount - xiuCount) / last12Results.length;
-    if (imbalance < 0.35) {
-        return last12Results[last12Results.length - 1] === 'Xỉu' ? 1 : 2;
-    }
-    return xiuCount > taiCount ? 1 : 2;
+function trendAndProb(hist) {
+  if (hist.length < 4) return 0;
+  const { streak, current, breakProb } = detectStreakAndBreak(hist);
+  if (streak >= 6) return breakProb > 0.8 ? (current === "Tài" ? "Xỉu" : "Tài") : current;
+  const last20 = hist.slice(-20).map(x => x.result);
+  const weights = last20.map((_, i) => Math.pow(1.3, i));
+  const tW = weights.reduce((s, w, i) => s + (last20[i] === "Tài" ? w : 0), 0);
+  const xW = weights.reduce((s, w, i) => s + (last20[i] === "Xỉu" ? w : 0), 0);
+  if (tW + xW === 0) return last20.at(-1) === "Xỉu" ? "Tài" : "Xỉu";
+  if (Math.abs(tW - xW) / (tW + xW) >= 0.3) return tW > xW ? "Tài" : "Xỉu";
+  return last20.at(-1) === "Xỉu" ? "Tài" : "Xỉu";
 }
 
-function recentSwitch(history) {
-    if (!history || history.length < 3) return 0;
-    const { streak, currentResult, breakProb } = detectStreakAndBreak(history);
-    if (streak >= 4) {
-        if (breakProb > 0.75) return currentResult === 'Tài' ? 2 : 1;
-        return currentResult === 'Tài' ? 1 : 2;
-    }
-    const last10Results = history.slice(-10).map(item => item.result);
-    if (!last10Results.length) return 0;
-    const switches = last10Results.slice(1).reduce((count, result, index) => {
-        return count + (result !== last10Results[index] ? 1 : 0);
-    }, 0);
-    return switches >= 6 ?
-        (last10Results[last10Results.length - 1] === 'Xỉu' ? 1 : 2) :
-        (last10Results[last10Results.length - 1] === 'Xỉu' ? 1 : 2);
+function shortPattern(hist) {
+  if (hist.length < 4) return 0;
+  const { streak, current, breakProb } = detectStreakAndBreak(hist);
+  if (streak >= 5) return breakProb > 0.8 ? (current === "Tài" ? "Xỉu" : "Tài") : current;
+  const last10 = hist.slice(-10).map(x => x.result);
+  // n-gram 4 ngắn
+  const pc = {};
+  for (let i = 0; i <= last10.length - 4; i++) {
+    const k = last10.slice(i, i + 4).join(",");
+    pc[k] = (pc[k] || 0) + 1;
+  }
+  const c = Object.entries(pc).sort((a, b) => b[1] - a[1])[0];
+  if (c && c[1] >= 3) {
+    const parts = c[0].split(",");
+    return parts.at(-1) !== last10.at(-1) ? (last10.at(-1) === "Tài" ? "Xỉu" : "Tài") : last10.at(-1);
+  }
+  return last10.at(-1) === "Xỉu" ? "Tài" : "Xỉu";
 }
 
-function isBadPattern(history) {
-    if (!history || history.length < 3) return false;
-    const last15Results = history.slice(-15).map(item => item.result);
-    if (!last15Results.length) return false;
-    const switches = last15Results.slice(1).reduce((count, result, index) => {
-        return count + (result !== last15Results[index] ? 1 : 0);
-    }, 0);
-    const { streak } = detectStreakAndBreak(history);
-    return switches >= 9 || streak >= 10;
+function meanDeviation(hist) {
+  if (hist.length < 4) return 0;
+  const last15 = hist.slice(-15).map(x => x.result);
+  const t = last15.filter(r => r === "Tài").length;
+  const x = last15.length - t;
+  const imb = last15.length ? Math.abs(t - x) / last15.length : 0;
+  if (imb < 0.3) return last15.at(-1) === "Xỉu" ? "Tài" : "Xỉu";
+  return x > t ? "Xỉu" : "Tài";
 }
 
-function aiHtddLogic(history) {
-    if (!history || history.length < 3) {
-        const randomPred = Math.random() < 0.5 ? 'Tài' : 'Xỉu';
-        return { prediction: randomPred, reason: 'Không đủ lịch sử, dự đoán ngẫu nhiên', source: 'AI HTDD' };
-    }
-    const last5Results = history.slice(-5).map(item => item.result);
-    const last5Scores = history.slice(-5).map(item => item.score || 0);
-    const taiCount = last5Results.filter(result => result === 'Tài').length;
-    const xiuCount = last5Results.filter(result => result === 'Xỉu').length;
-    if (history.length >= 3) {
-        const last3Results = history.slice(-3).map(item => item.result);
-        if (last3Results.join(',') === 'Tài,Xỉu,Tài') {
-            return { prediction: 'Xỉu', reason: 'Phát hiện mẫu 1T1X → nên đánh Xỉu', source: 'AI HTDD' };
-        } else if (last3Results.join(',') === 'Xỉu,Tài,Xỉu') {
-            return { prediction: 'Tài', reason: 'Phát hiện mẫu 1X1T → nên đánh Tài', source: 'AI HTDD' };
-        }
-    }
-    if (history.length >= 4) {
-        const last4Results = history.slice(-4).map(item => item.result);
-        if (last4Results.join(',') === 'Tài,Tài,Xỉu,Xỉu') {
-            return { prediction: 'Tài', reason: 'Phát hiện mẫu 2T2X → nên đánh Tài', source: 'AI HTDD' };
-        } else if (last4Results.join(',') === 'Xỉu,Xỉu,Tài,Tài') {
-            return { prediction: 'Xỉu', reason: 'Phát hiện mẫu 2X2T → nên đánh Xỉu', source: 'AI HTDD' };
-        }
-    }
-    if (history.length >= 9 && history.slice(-6).every(item => item.result === 'Tài')) {
-        return { prediction: 'Xỉu', reason: 'Chuỗi Tài quá dài (6 lần) → dự đoán Xỉu', source: 'AI HTDD' };
-    } else if (history.length >= 9 && history.slice(-6).every(item => item.result === 'Xỉu')) {
-        return { prediction: 'Tài', reason: 'Chuỗi Xỉu quá dài (6 lần) → dự đoán Tài', source: 'AI HTDD' };
-    }
-    const avgScore = last5Scores.reduce((sum, score) => sum + score, 0) / (last5Scores.length || 1);
-    if (avgScore > 10) {
-        return { prediction: 'Tài', reason: `Điểm trung bình cao (${avgScore.toFixed(1)}) → dự đoán Tài`, source: 'AI HTDD' };
-    } else if (avgScore < 8) {
-        return { prediction: 'Xỉu', reason: `Điểm trung bình thấp (${avgScore.toFixed(1)}) → dự đoán Xỉu`, source: 'AI HTDD' };
-    }
-    if (taiCount > xiuCount + 1) {
-        return { prediction: 'Xỉu', reason: `Tài chiếm đa số (${taiCount}/${last5Results.length}) → dự đoán Xỉu`, source: 'AI HTDD' };
-    } else if (xiuCount > taiCount + 1) {
-        return { prediction: 'Tài', reason: `Xỉu chiếm đa số (${xiuCount}/${last5Results.length}) → dự đoán Tài`, source: 'AI HTDD' };
-    } else {
-        const totalTai = history.filter(item => item.result === 'Tài').length;
-        const totalXiu = history.filter(item => item.result === 'Xỉu').length;
-        if (totalTai > totalXiu + 2) {
-            return { prediction: 'Xỉu', reason: 'Tổng thể Tài nhiều hơn → dự đoán Xỉu', source: 'AI HTDD' };
-        } else if (totalXiu > totalTai + 2) {
-            return { prediction: 'Tài', reason: 'Tổng thể Xỉu nhiều hơn → dự đoán Tài', source: 'AI HTDD' };
-        } else {
-            const randomPred = Math.random() < 0.5 ? 'Tài' : 'Xỉu';
-            return { prediction: randomPred, reason: 'Cân bằng, dự đoán ngẫu nhiên', source: 'AI HTDD' };
-        }
-    }
+function recentSwitch(hist) {
+  if (hist.length < 4) return 0;
+  const last12 = hist.slice(-12).map(x => x.result);
+  const sw = last12.slice(1).reduce((c, r, i) => c + (r !== last12[i] ? 1 : 0), 0);
+  return sw >= 7 ? (last12.at(-1) === "Xỉu" ? "Tài" : "Xỉu") : (last12.at(-1) === "Xỉu" ? "Tài" : "Xỉu");
 }
 
-function generatePrediction(history, predictions) {
-    modelPredictions = predictions || {};
-    if (!history || history.length === 0) {
-        const randomPred = Math.random() < 0.5 ? 'Tài' : 'Xỉu';
-        return { prediction: randomPred, reason: 'Không đủ lịch sử', scores: { taiScore: 0, xiuScore: 0 } };
-    }
-    if (!modelPredictions.trend) {
-        modelPredictions = { trend: {}, short: {}, mean: {}, switch: {}, bridge: {} };
-    }
-    const currentSession = history[history.length - 1].session;
-    const trendPred = history.length < 5 ? (history[history.length - 1].result === 'Tài' ? 2 : 1) : trendAndProb(history);
-    const shortPred = history.length < 5 ? (history[history.length - 1].result === 'Tài' ? 2 : 1) : shortPattern(history);
-    const meanPred = history.length < 5 ? (history[history.length - 1].result === 'Tài' ? 2 : 1) : meanDeviation(history);
-    const switchPred = history.length < 5 ? (history[history.length - 1].result === 'Tài' ? 2 : 1) : recentSwitch(history);
-    const bridgePred = history.length < 5 ? { prediction: history[history.length - 1].result === 'Tài' ? 2 : 1, breakProb: 0, reason: 'Lịch sử ngắn' } : smartBridgeBreak(history);
-    const aiPred = aiHtddLogic(history);
-    modelPredictions.trend[currentSession] = trendPred;
-    modelPredictions.short[currentSession] = shortPred;
-    modelPredictions.mean[currentSession] = meanPred;
-    modelPredictions.switch[currentSession] = switchPred;
-    modelPredictions.bridge[currentSession] = bridgePred.prediction;
-    const modelPerformance = {
-        trend: evaluateModelPerformance(history, 'trend'),
-        short: evaluateModelPerformance(history, 'short'),
-        mean: evaluateModelPerformance(history, 'mean'),
-        switch: evaluateModelPerformance(history, 'switch'),
-        bridge: evaluateModelPerformance(history, 'bridge')
-    };
-    const modelWeights = {
-        trend: 0.2 * modelPerformance.trend,
-        short: 0.2 * modelPerformance.short,
-        mean: 0.25 * modelPerformance.mean,
-        switch: 0.2 * modelPerformance.switch,
-        bridge: 0.15 * modelPerformance.bridge,
-        aihtdd: 0.2
-    };
-    let taiScore = 0;
-    let xiuScore = 0;
-    if (trendPred === 1) taiScore += modelWeights.trend;
-    else if (trendPred === 2) xiuScore += modelWeights.trend;
-    if (shortPred === 1) taiScore += modelWeights.short;
-    else if (shortPred === 2) xiuScore += modelWeights.short;
-    if (meanPred === 1) taiScore += modelWeights.mean;
-    else if (meanPred === 2) xiuScore += modelWeights.mean;
-    if (switchPred === 1) taiScore += modelWeights.switch;
-    else if (switchPred === 2) xiuScore += modelWeights.switch;
-    if (bridgePred.prediction === 1) taiScore += modelWeights.bridge;
-    else if (bridgePred.prediction === 2) xiuScore += modelWeights.bridge;
-    if (aiPred.prediction === 'Tài') taiScore += modelWeights.aihtdd;
-    else xiuScore += modelWeights.aihtdd;
-    if (isBadPattern(history)) {
-        taiScore *= 0.8;
-        xiuScore *= 0.8;
-    }
-    const last10Results = history.slice(-10).map(item => item.result);
-    const last10TaiCount = last10Results.filter(result => result === 'Tài').length;
-    if (last10TaiCount >= 7) {
-        xiuScore += 0.15;
-    } else if (last10TaiCount <= 3) {
-        taiScore += 0.15;
-    }
-    if (bridgePred.breakProb > 0.65) {
-        if (bridgePred.prediction === 1) taiScore += 0.2;
-        else xiuScore += 0.2;
-    }
-    const finalPrediction = taiScore > xiuScore ? 'Tài' : 'Xỉu';
-    return { prediction: finalPrediction, reason: `${aiPred.reason} | ${bridgePred.reason}`, scores: { taiScore, xiuScore } };
+function aiHtddLogic(hist) {
+  if (hist.length < 4) return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", reason: "Không đủ lịch sử" };
+
+  const last7R = hist.slice(-7).map(x => x.result);
+  const last4 = hist.slice(-4).map(x => x.result);
+  if (last4.join(",") === "Tài,Xỉu,Tài,Xỉu") return { pred: "Tài", reason: "Mẫu 1T1X lặp" };
+  if (last4.join(",") === "Xỉu,Tài,Xỉu,Tài") return { pred: "Xỉu", reason: "Mẫu 1X1T lặp" };
+
+  const last5 = hist.slice(-5).map(x => x.result);
+  if (last5.join(",") === "Tài,Tài,Xỉu,Xỉu,Tài") return { pred: "Xỉu", reason: "Mẫu 2T2X1T" };
+  if (last5.join(",") === "Xỉu,Xỉu,Tài,Tài,Xỉu") return { pred: "Tài", reason: "Mẫu 2X2T1X" };
+
+  // Streak 7
+  if (hist.length >= 10 && hist.slice(-7).every(i => i.result === "Tài")) return { pred: "Xỉu", reason: "Chuỗi Tài dài" };
+  if (hist.length >= 10 && hist.slice(-7).every(i => i.result === "Xỉu")) return { pred: "Tài", reason: "Chuỗi Xỉu dài" };
+
+  // Điểm trung bình & phương sai (trên tổng)
+  const scores = hist.slice(-7).map(x => x.total || 0);
+  const avg = scores.reduce((s, v) => s + v, 0) / (scores.length || 1);
+  const varc = scores.reduce((s, v) => s + (v - avg) ** 2, 0) / (scores.length || 1);
+
+  if (avg > 10.5 && varc > 8) return { pred: "Xỉu", reason: `Điểm cao, variance lớn (${r01(varc)})` };
+  if (avg > 10.5) return { pred: "Tài", reason: `Điểm TB cao (${r01(avg)})` };
+  if (avg < 10.5 && varc > 8) return { pred: "Tài", reason: `Điểm thấp, variance lớn (${r01(varc)})` };
+  if (avg < 10.5) return { pred: "Xỉu", reason: `Điểm TB thấp (${r01(avg)})` };
+
+  // Cân bằng → random có điều kiện
+  const t = last7R.filter(r => r === "Tài").length;
+  const x = last7R.length - t;
+  if (t > x + 2) return { pred: "Xỉu", reason: "Thiên Tài → cân bằng" };
+  if (x > t + 2) return { pred: "Tài", reason: "Thiên Xỉu → cân bằng" };
+  return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", reason: "Cân bằng hoàn hảo" };
 }
 
-// ==================== ENDPOINT API ====================
+// ====== Sử dụng Mau_cau (n-gram 'T'/'X') để dự đoán ======
+function mauCauPredict() {
+  if (history.length < 6) return { pred: null, weight: 0, note: "Thiếu dài chuỗi" };
+  const seq = history.map(h => toTX(h.result));
+  const window = seq.slice(-5); // lấy 5 ký tự gần nhất để thử n=5,4,3
+  const tries = [
+    { n: 5, key: window.slice(-5).join("") },
+    { n: 4, key: window.slice(-4).join("") },
+    { n: 3, key: window.slice(-3).join("") },
+  ];
 
-app.get('/api/predict', async (req, res) => {
-    try {
-        const response = await fetch(API_URL);
-        if (!response.ok) {
-            throw new Error('Failed to fetch data from game API');
-        }
-        const gameData = await response.json();
-        
-        // Tạo dữ liệu lịch sử giả định hoặc lấy từ một nguồn tin cậy
-        const historyData = [
-            { session: gameData.Phien - 5, result: "Tài", score: 12 },
-            { session: gameData.Phien - 4, result: "Xỉu", score: 9 },
-            { session: gameData.Phien - 3, result: "Tài", score: 10 },
-            { session: gameData.Phien - 2, result: "Tài", score: 11 },
-            { session: gameData.Phien - 1, result: "Xỉu", score: 8 }
-        ];
-
-        // Lấy kết quả cuối cùng từ API và thêm vào history
-        const lastResult = (gameData.Xuc_xac_1 + gameData.Xuc_xac_2 + gameData.Xuc_xac_3) >= 11 ? 'Tài' : 'Xỉu';
-        historyData.push({ session: gameData.Phien, result: lastResult, score: (gameData.Xuc_xac_1 + gameData.Xuc_xac_2 + gameData.Xuc_xac_3) });
-        
-        // Gọi hàm dự đoán của bạn
-        const predictionResult = generatePrediction(historyData, {});
-
-        const lastSession = historyData[historyData.length - 1];
-        const phien_truoc = lastSession ? lastSession.session : null;
-        const ket_qua = lastSession ? lastSession.result : null;
-        const phien_sau = phien_truoc ? phien_truoc + 1 : null;
-        const do_tin_cay = (predictionResult.scores.taiScore + predictionResult.scores.xiuScore).toFixed(2);
-        const giai_thich = predictionResult.reason;
-        
-        res.json({
-            Phien_truoc: phien_truoc,
-            Ket_qua: ket_qua,
-            Phien_sau: phien_sau,
-            Du_doan: predictionResult.prediction,
-            Do_tin_cay: do_tin_cay,
-            Giai_thich: giai_thich,
-            id: "Tele@Idol_vannhat"
-        });
-
-    } catch (error) {
-        console.error('Error in API route:', error);
-        res.status(500).json({ error: 'Failed to generate prediction', details: error.message });
+  for (const t of tries) {
+    const mem = patternMemory[t.n]?.[t.key];
+    if (mem && (mem.T > 0 || mem.X > 0)) {
+      const pred = mem.T === mem.X ? (Math.random() < 0.5 ? "T" : "X") : (mem.T > mem.X ? "T" : "X");
+      const conf = (Math.max(mem.T, mem.X) / (mem.T + mem.X));
+      return { pred: pred === "T" ? "Tài" : "Xỉu", weight: 0.28 + conf * 0.22, note: `Mẫu ${t.n}-gram (${t.key}→${pred})` };
     }
+  }
+  return { pred: null, weight: 0, note: "Không khớp mẫu n-gram" };
+}
+
+// ====== Hợp nhất mô-đun để ra dự đoán cuối ======
+function finalPredict() {
+  if (history.length === 0) {
+    return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", conf: 0.5, explain: "Không có dữ liệu" };
+  }
+
+  const curSession = history.at(-1).session;
+
+  // Lấy dự đoán từng mô-đun
+  const tPred = trendAndProb(history);             // "Tài"/"Xỉu"
+  const sPred = shortPattern(history);
+  const mPred = meanDeviation(history);
+  const swPred = recentSwitch(history);
+  const br = smartBridgeBreak(history);
+  const mk = markovTransitionProb(history);
+  const ai = aiHtddLogic(history);
+  const mc = mauCauPredict();
+
+  // Gán weight (đã tinh chỉnh)
+  const perf = (name, lb = 15) => evaluatePerformance(name, lb);
+  const weights = {
+    trend: 0.18 * perf("trend"),
+    short: 0.18 * perf("short"),
+    mean:  0.22 * perf("mean"),
+    switch:0.18 * perf("switch"),
+    bridge:0.14 * perf("bridge"),
+    markov:0.10 * perf("markov"),
+    aihtdd:0.20 * perf("aihtdd"),
+    mau:   mc.weight || 0.22, // weight linh hoạt theo độ mạnh pattern
+  };
+
+  let taiScore = 0, xiuScore = 0;
+  const add = (p, w) => { if (p === "Tài") taiScore += w; else if (p === "Xỉu") xiuScore += w; };
+
+  add(tPred, weights.trend);
+  add(sPred, weights.short);
+  add(mPred, weights.mean);
+  add(swPred, weights.switch);
+  add(br.pred, weights.bridge);
+  add(mk.taiProb > mk.xiuProb ? "Tài" : "Xỉu", weights.markov);
+  add(ai.pred, weights.aihtdd);
+  if (mc.pred) add(mc.pred, weights.mau);
+
+  // Momentum: ưu tiên kết quả gần đây
+  const last5 = history.slice(-5).map(x => x.result);
+  const mom = (last5.filter(r => r === "Tài").length > 2) ? 0.15 : -0.15;
+  if (mom > 0) taiScore += mom; else xiuScore += Math.abs(mom);
+
+  // Nếu mẫu xấu (nhiễu cao) thì giảm đều
+  if (isBadPattern(history)) { taiScore *= 0.75; xiuScore *= 0.75; }
+
+  // Điều chỉnh thiên lệch 15 phiên gần
+  const last15 = history.slice(-15).map(x => x.result);
+  const t15 = last15.filter(r => r === "Tài").length;
+  if (t15 >= 10) xiuScore += 0.2; else if (t15 <= 5) taiScore += 0.2;
+
+  const pred = taiScore >= xiuScore ? "Tài" : "Xỉu";
+  const conf = Math.min(0.98, Math.max(0.52, 0.5 + Math.abs(taiScore - xiuScore))); // 0.52–0.98
+
+  // Lưu lại để chấm hiệu năng sau này
+  if (!modelPredictions[curSession]) modelPredictions[curSession] = {};
+  modelPredictions[curSession] = {
+    trend: tPred, short: sPred, mean: mPred, switch: swPred, bridge: br.pred,
+    markov: mk.taiProb > mk.xiuProb ? "Tài" : "Xỉu",
+    aihtdd: ai.pred, mau: mc.pred || "None",
+    final: pred
+  };
+
+  const explain = [
+    `AI: ${ai.reason}`,
+    `Bridge: ${br.reason} (p=${r01(br.prob)})`,
+    `Markov T=${r01(mk.taiProb)} X=${r01(mk.xiuProb)}`,
+    `Mẫu_cầu: ${mc.note}`,
+    `Điểm T=${r01(taiScore)} · X=${r01(xiuScore)}`
+  ].join(" | ");
+
+  return { pred, conf: r01(conf), explain };
+}
+
+function isBadPattern(hist) {
+  const last20 = hist.slice(-20).map(x => x.result);
+  const sw = last20.slice(1).reduce((c, r, i) => c + (r !== last20[i] ? 1 : 0), 0);
+  const { streak } = detectStreakAndBreak(hist);
+  return sw >= 12 || streak >= 11;
+}
+
+// Chấm “hiệu năng mô-đun” (nhẹ) để tự điều chỉnh weight
+function evaluatePerformance(modelName, lookback = 15) {
+  const keys = Object.keys(modelPredictions).map(k => Number(k)).sort((a, b) => a - b);
+  if (keys.length < 2) return 1;
+  const use = keys.slice(-lookback - 1); // cần phiên-1 để so phiên hiện thực
+  let correct = 0, total = 0;
+
+  for (let i = 1; i < use.length; i++) {
+    const sessPrev = use[i - 1];     // dự đoán cho sessPrev -> so với kết quả ở sessPrev (đã biết)
+    const sessNow = use[i];          // bước qua phiên mới
+    const m = modelPredictions[sessPrev];
+    const actual = history.find(h => h.session === sessPrev)?.result;
+    if (!m || !actual) continue;
+    const pred = m[modelName];
+    if (pred === actual) correct++;
+    total++;
+  }
+  if (!total) return 1;
+  const ratio = 1 + (correct - total / 2) / (total / 2);
+  return Math.max(0.6, Math.min(1.6, ratio));
+}
+
+// ====== Endpoint chính ======
+app.get("/api/custom", async (req, res) => {
+  try {
+    await loadSource(); // cập nhật history & patternMemory
+
+    if (history.length === 0) {
+      return res.status(500).json({ error: "Không có dữ liệu lịch sử" });
+    }
+
+    const latest = history.at(-1);
+    const { session, dice, total, result } = latest;
+
+    // Mau_cau: 1 phiên lưu 1 ký tự theo kết quả phiên đó
+    const Mau_cau = result === "Tài" ? "T" : "X";
+
+    // Dự đoán cho PHIÊN SAU
+    const { pred, conf, explain } = finalPredict();
+
+    res.json({
+      id: "Tele@idol_vannhat",
+      Phien_truoc: session,
+      Phien_sau: session + 1,
+      Xuc_xac: dice,
+      Tong: total,
+      Ket_qua: result,
+      Du_doan: pred,
+      Do_tin_cay: conf,
+      Giai_thich: explain,
+      Mau_cau: Mau_cau
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Lỗi xử lý", detail: err.message });
+  }
 });
 
-app.get('/', (req, res) => {
-    res.send('API is running. Use GET /api/predict to get a prediction.');
-});
+// ====== Tiện ích: xem nhanh log/health ======
+app.get("/", (_req, res) => res.send("Taixiu SIÊU VIP API ok. Use /api/custom"));
+app.get("/debug/history", (_req, res) => res.json(history.slice(-50)));
+app.get("/debug/pattern", (_req, res) => res.json(patternMemory));
 
-// Khởi động server
 app.listen(PORT, () => {
-    console.log(`API server listening on port ${PORT}`);
+  console.log(`✅ API chạy: http://localhost:${PORT}/api/custom`);
 });
