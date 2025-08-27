@@ -1,5 +1,5 @@
 /**
- * API Taixiu ULTIMATE VIP PRO – by Tele@idol_vannhat
+ * API Taixiu ULTIMATE VIP PRO v2 – by Tele@idol_vannhat
  * Node >= 18 (có fetch sẵn)
  * Endpoint: GET /api/predict
  * Trả về:
@@ -244,10 +244,12 @@ function mauCau15Predict() {
   }
 
   // Phát hiện mẫu bậc thang
-  const last8 = seq.slice(-8);
-  let stair = 0;
-  for (let i = 2; i < last8.length; i++) {
-    if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
+  let stair = 0; // Khởi tạo stair để tránh lỗi
+  const last8 = seq.slice(-8).length >= 8 ? seq.slice(-8) : [];
+  if (last8.length >= 3) {
+    for (let i = 2; i < last8.length; i++) {
+      if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
+    }
   }
   if (stair >= 2) {
     const lastChar = MC.at(-1);
@@ -265,11 +267,13 @@ function mauCau15Predict() {
   let entropyAvg = 0;
   windows.forEach((w) => {
     const subSeq = seq.slice(-w);
-    const cntT = subSeq.filter((c) => c === "T").length;
-    const pT_w = cntT / w;
-    const pX_w = 1 - pT_w;
-    const H = -(pT_w ? pT_w * Math.log2(pT_w) : 0) - (pX_w ? pX_w * Math.log2(pX_w) : 0);
-    entropyAvg += H / windows.length;
+    if (subSeq.length === w) {
+      const cntT = subSeq.filter((c) => c === "T").length;
+      const pT_w = cntT / w;
+      const pX_w = 1 - pT_w;
+      const H = -(pT_w ? pT_w * Math.log2(pT_w) : 0) - (pX_w ? pX_w * Math.log2(pX_w) : 0);
+      entropyAvg += H / windows.length;
+    }
   });
 
   const confBoost = entropyAvg < 0.8 ? 0.12 : 0;
@@ -289,8 +293,10 @@ function aiProAnalyzer(hist) {
   const last8 = hist.slice(-8).map((x) => x.result);
 
   let stair = 0;
-  for (let i = 2; i < last8.length; i++) {
-    if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
+  if (last8.length >= 3) {
+    for (let i = 2; i < last8.length; i++) {
+      if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
+    }
   }
 
   const sw8 = last8.slice(1).reduce((c, r, i) => c + (r !== last8[i] ? 1 : 0), 0);
@@ -314,7 +320,7 @@ function aiProAnalyzer(hist) {
   };
 }
 
-// ============= Hợp nhất dự đoán (Ultimate VIP PRO) =============
+// ============= Hợp nhất dự đoán (Ultimate VIP PRO v2) =============
 function finalPredict() {
   if (history.length === 0) {
     return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", conf: 0.5, explain: "Không có dữ liệu" };
@@ -453,7 +459,7 @@ app.get("/api/predict", async (_req, res) => {
 });
 
 // ============= Debug/Health =============
-app.get("/", (_req, res) => res.send("Taixiu ULTIMATE VIP PRO API ok. Use /api/predict"));
+app.get("/", (_req, res) => res.send("Taixiu ULTIMATE VIP PRO v2 API ok. Use /api/predict"));
 app.get("/debug/history", (_req, res) => res.json(history.slice(-80)));
 app.get("/debug/pattern", (_req, res) => res.json(patternMemory));
 app.get("/debug/predict_modules", (_req, res) => {
