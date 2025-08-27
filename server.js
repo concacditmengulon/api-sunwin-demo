@@ -1,13 +1,11 @@
 /**
- * API Taixiu SIÊU VIP – by Tele@idol_vannhat
+ * API Taixiu ULTIMATE VIP PRO – by Tele@idol_vannhat
  * Node >= 18 (có fetch sẵn)
- * Endpoint: GET /api/custom
+ * Endpoint: GET /api/predict
  * Trả về:
  * {
- * id: "Tele@idol_vannhat",
- * Phien_truoc, Phien_sau,
- * Xuc_xac: [x1,x2,x3],
- * Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
+ *   id: "Tele@idol_vannhat",
+ *   Phien_truoc, Phien_sau, Xuc_xac, Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
  * }
  */
 
@@ -20,12 +18,13 @@ const PORT = process.env.PORT || 3000;
 const SOURCE_API = "https://sunai.onrender.com/api/taixiu/history";
 
 // ============= Bộ nhớ trong server =============
-let history = [];            // [{session, dice:[a,b,c], total, result}]
-let patternMemory = {};      // n-gram 'T'/'X' -> đếm tần suất tiếp theo
-let modelPredictions = {};   // {session: {module: "Tài"/"Xỉu", ... , final}}
+let history = []; // [{session, dice:[a,b,c], total, result}]
+let patternMemory = {}; // n-gram 'T'/'X' -> tần suất tiếp theo
+let modelPredictions = {}; // {session: {module: "Tài"/"Xỉu", ... , final}}
 let predictionsHistory = []; // {session, du_doan, ket_qua, do_tin_cay, danh_gia}
-const MAX_HISTORY = 400;
-const MAX_PREDICTIONS_HISTORY = 200;
+let modelWeights = { markov: 0.15, proAI: 0.25, mau15: 0.35, dice: 0.25 }; // Trọng số khởi tạo
+const MAX_HISTORY = 300; // Giảm để tối ưu bộ nhớ
+const MAX_PREDICTIONS_HISTORY = 150;
 
 // ============= Tiện ích chung =============
 const r01 = (x) => Math.round(x * 100) / 100;
@@ -36,33 +35,36 @@ const fromTX = (c) => (c === "T" ? "Tài" : "Xỉu");
 
 // ============= Nạp & chuẩn hoá dữ liệu =============
 async function loadSource() {
-  const resp = await fetch(SOURCE_API, { cache: "no-store" });
-  const data = await resp.json();
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error("API nguồn không trả mảng dữ liệu hợp lệ");
+  try {
+    const resp = await fetch(SOURCE_API, { cache: "no-store" });
+    const data = await resp.json();
+    if (!Array.isArray(data) || data.length === 0) {
+      throw new Error("API nguồn không trả mảng dữ liệu hợp lệ");
+    }
+    const norm = data
+      .filter((x) => x && typeof x.session !== "undefined")
+      .map((x) => ({
+        session: Number(x.session),
+        dice: Array.isArray(x.dice) ? x.dice.map(Number) : [0, 0, 0],
+        total: Number(x.total ?? 0),
+        result: x.result === "Tài" || x.result === "Xỉu" ? x.result : Number(x.total ?? 0) >= 11 ? "Tài" : "Xỉu",
+      }))
+      .sort((a, b) => a.session - b.session);
+
+    const seen = new Set(history.map((h) => h.session));
+    for (const row of norm) if (!seen.has(row.session)) history.push(row);
+    if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
+
+    rebuildPatternMemory();
+    updateModelWeights(); // Cập nhật trọng số sau khi nạp dữ liệu
+  } catch (err) {
+    console.error("Lỗi loadSource:", err.message);
   }
-  const norm = data
-    .filter(x => x && typeof x.session !== "undefined")
-    .map(x => ({
-      session: Number(x.session),
-      dice: Array.isArray(x.dice) ? x.dice.map(Number) : [0, 0, 0],
-      total: Number(x.total ?? 0),
-      result: x.result === "Tài" || x.result === "Xỉu"
-        ? x.result
-        : (Number(x.total ?? 0) >= 11 ? "Tài" : "Xỉu")
-    }))
-    .sort((a, b) => a.session - b.session);
-
-  const seen = new Set(history.map(h => h.session));
-  for (const row of norm) if (!seen.has(row.session)) history.push(row);
-  if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
-
-  rebuildPatternMemory();
 }
 
 function rebuildPatternMemory() {
   patternMemory = {};
-  const seq = history.map(h => toTX(h.result)); // 'T'/'X'
+  const seq = history.map((h) => toTX(h.result));
   const N = seq.length;
   const ns = [3, 4, 5];
   for (const n of ns) {
@@ -74,6 +76,41 @@ function rebuildPatternMemory() {
       patternMemory[n][key][nxt]++;
     }
   }
+}
+
+// ============= Tự động cập nhật trọng số (Logistic Regression đơn giản) =============
+function updateModelWeights(lookback = 50) {
+  const keys = Object.keys(modelPredictions).map(Number).sort((a, b) => a - b);
+  if (keys.length < 10) return;
+
+  const use = keys.slice(-lookback);
+  const models = ["markov", "proAI", "mau15", "dice"];
+  let correct = { markov: 0, proAI: 0, mau15: 0, dice: 0 };
+  let total = 0;
+
+  for (let i = 1; i < use.length; i++) {
+    const prev = use[i - 1];
+    const m = modelPredictions[prev];
+    const actual = history.find((h) => h.session === prev)?.result;
+    if (!m || !actual) continue;
+    models.forEach((model) => {
+      if (m[model] === actual) correct[model]++;
+    });
+    total++;
+  }
+
+  if (total === 0) return;
+  const learningRate = 0.05;
+  models.forEach((model) => {
+    const accuracy = correct[model] / total;
+    modelWeights[model] = clamp(modelWeights[model] + learningRate * (accuracy - 0.5), 0.1, 0.4);
+  });
+
+  // Chuẩn hóa trọng số
+  const sum = Object.values(modelWeights).reduce((s, w) => s + w, 0);
+  models.forEach((model) => {
+    modelWeights[model] = r01(modelWeights[model] / sum);
+  });
 }
 
 // ============= Phân tích nền tảng =============
@@ -90,23 +127,18 @@ function detectStreak(hist) {
 
 function breakProbability(hist) {
   const { streak, current } = detectStreak(hist);
-  const last20 = hist.slice(-20).map(x => x.result);
+  const last20 = hist.slice(-20).map((x) => x.result);
   const switches = last20.slice(1).reduce((c, r, i) => c + (r !== last20[i] ? 1 : 0), 0);
-  const taiCount = last20.filter(r => r === "Tài").length;
+  const taiCount = last20.filter((r) => r === "Tài").length;
   const pT = last20.length ? taiCount / last20.length : 0.5;
   const pX = 1 - pT;
   const entropy = -(pT ? pT * Math.log2(pT) : 0) - (pX ? pX * Math.log2(pX) : 0);
 
-  let base =
-    streak >= 9 ? 0.78 :
-    streak >= 7 ? 0.6 :
-    streak >= 5 ? 0.45 :
-    streak >= 4 ? 0.35 : 0.25;
+  let base = streak >= 9 ? 0.85 : streak >= 7 ? 0.75 : streak >= 5 ? 0.6 : streak >= 4 ? 0.45 : 0.35;
+  base += switches / 45;
+  base += entropy < 0.8 ? 0.12 : 0;
 
-  base += switches / 50;           // càng đảo chiều nhiều càng dễ bẻ
-  base += entropy < 0.85 ? 0.08 : 0; // thiên lệch mạnh → dễ bẻ
-
-  return clamp(base, 0.05, 0.96);
+  return clamp(base, 0.1, 0.98);
 }
 
 function markovTransition(hist) {
@@ -114,327 +146,283 @@ function markovTransition(hist) {
   const M = { Tài: { Tài: 0, Xỉu: 0 }, Xỉu: { Tài: 0, Xỉu: 0 } };
   for (let i = 1; i < hist.length; i++) M[hist[i - 1].result][hist[i].result]++;
   const cur = hist.at(-1).result;
-  const a = M[cur].Tài + 1; // Laplace
+  const a = M[cur].Tài + 1;
   const b = M[cur].Xỉu + 1;
   const pT = a / (a + b);
   return { pT, pX: 1 - pT };
 }
 
-function totalsStats(hist, k = 12) {
-  const v = hist.slice(-k).map(x => x.total || 0);
+function totalsStats(hist, k = 15) {
+  const v = hist.slice(-k).map((x) => x.total || 0);
   const avg = v.reduce((s, x) => s + x, 0) / (v.length || 1);
   const varc = v.reduce((s, x) => s + (x - avg) ** 2, 0) / (v.length || 1);
   return { avg, varc };
 }
 
-// ============= Phân tích Mau_cau-15 =============
-/**
- * Dùng 15 ký tự T/X gần nhất để ra P(next=T/X)
- * - n-gram context 5,4,3 với Laplace smoothing
- * - run-length & alternating penalty
- * - entropy control
- */
+// ============= Phân tích xúc xắc (Nâng cao) =============
+function diceAnalyzer(hist, k = 15) {
+  if (hist.length < k) return { pred: null, conf: 0.5, note: "Thiếu dữ liệu xúc xắc" };
+
+  const recent = hist.slice(-k);
+  const diceValues = recent.flatMap((h) => h.dice);
+  const totalAvg = recent.reduce((s, h) => s + h.total, 0) / k;
+
+  const freq = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
+  diceValues.forEach((d) => freq[d]++);
+  const highFreq = (freq[5] + freq[6]) / (k * 3);
+  const lowFreq = (freq[1] + freq[2]) / (k * 3);
+
+  // Phát hiện cặp xúc xắc lặp lại
+  const pairs = {};
+  recent.forEach((h) => {
+    const key = h.dice.sort().join(",");
+    pairs[key] = (pairs[key] || 0) + 1;
+  });
+  const topPair = Object.entries(pairs).sort((a, b) => b[1] - a[1])[0];
+  const pairBoost = topPair && topPair[1] >= 3 ? 0.1 : 0;
+
+  let pT = 0.5;
+  if (totalAvg > 11 || highFreq > 0.35) pT += 0.2 + pairBoost;
+  if (totalAvg < 10 || lowFreq > 0.45) pT -= 0.2 + pairBoost;
+
+  const pred = pT >= 0.5 ? "Tài" : "Xỉu";
+  const conf = clamp(0.6 + Math.abs(pT - 0.5) * 0.95 + pairBoost, 0.55, 0.92);
+
+  return {
+    pred,
+    conf,
+    note: `Dice: avg=${r01(totalAvg)}, highFreq=${r01(highFreq)}, lowFreq=${r01(lowFreq)}, topPair=${topPair ? topPair[0] : "none"}`,
+  };
+}
+
+// ============= Phân tích Mau_cau-15 (Siêu cải tiến) =============
 function mauCau15Predict() {
   if (history.length < 16) return { pred: null, conf: 0.0, note: "Thiếu lịch sử" };
 
-  const seq = history.map(h => toTX(h.result));
-  const MC = seq.slice(-15);           // 15 ký tự cuối
-  const window5 = seq.slice(-5).join(""); // phục vụ lookup patternMemory
+  const seq = history.map((h) => toTX(h.result));
+  const MC = seq.slice(-15);
   const contexts = [
     { n: 5, key: seq.slice(-5).join("") },
     { n: 4, key: seq.slice(-4).join("") },
     { n: 3, key: seq.slice(-3).join("") },
   ];
 
-  // n-gram Bayes
-  let pT = 0.5, used = null;
+  let pT = 0.5,
+    used = null;
   for (const ctx of contexts) {
     const mem = patternMemory[ctx.n]?.[ctx.key];
     if (mem) {
-      const aT = mem.T + 1; // Laplace
+      const aT = mem.T + 1;
       const aX = mem.X + 1;
       const post = aT / (aT + aX);
-      pT = 0.6 * post + 0.4 * pT; // gộp mềm
+      pT = 0.65 * post + 0.35 * pT;
       used = `${ctx.n}-gram ${ctx.key}→T:${mem.T}/X:${mem.X}`;
     }
   }
 
-  // run-length trên chuỗi 15
-  let r = 1, lastC = MC[0], maxR = 1;
+  // Phân tích cấu trúc cầu
+  let r = 1,
+    lastC = MC[0],
+    maxR = 1,
+    runs = [];
   for (let i = 1; i < MC.length; i++) {
-    if (MC[i] === lastC) { r++; maxR = Math.max(maxR, r); }
-    else { r = 1; lastC = MC[i]; }
+    if (MC[i] === lastC) {
+      r++;
+      maxR = Math.max(maxR, r);
+    } else {
+      runs.push({ type: lastC, len: r });
+      r = 1;
+      lastC = MC[i];
+    }
   }
-  if (maxR >= 6) {
-    // chuỗi vừa qua rất dài → tăng xác suất đảo
+  runs.push({ type: lastC, len: r });
+
+  const avgRunLen = runs.reduce((s, r) => s + r.len, 0) / (runs.length || 1);
+  if (maxR >= 5 || (runs.at(-1).len >= avgRunLen + 1)) {
     const lastChar = MC.at(-1);
-    if (lastChar === "T") pT = clamp(pT - 0.1, 0.04, 0.96);
-    else pT = clamp(pT + 0.1, 0.04, 0.96);
+    pT = lastChar === "T" ? clamp(pT - 0.2, 0.05, 0.95) : clamp(pT + 0.2, 0.05, 0.95);
   }
 
-  // alternating mạnh (TXTX...) → ưu tiên giữ nhịp
+  // Phát hiện mẫu bậc thang
+  const last8 = seq.slice(-8);
+  let stair = 0;
+  for (let i = 2; i < last8.length; i++) {
+    if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
+  }
+  if (stair >= 2) {
+    const lastChar = MC.at(-1);
+    pT = lastChar === "T" ? clamp(pT - 0.1, 0.05, 0.95) : clamp(pT + 0.1, 0.05, 0.95);
+  }
+
   const sw = MC.slice(1).reduce((c, ch, i) => c + (ch !== MC[i] ? 1 : 0), 0);
-  if (sw >= 11) {
+  if (sw >= 12) {
     const lastChar = MC.at(-1);
-    pT = lastChar === "T" ? clamp(pT - 0.08, 0.04, 0.96) : clamp(pT + 0.08, 0.04, 0.96);
+    pT = lastChar === "T" ? clamp(pT - 0.15, 0.05, 0.95) : clamp(pT + 0.15, 0.05, 0.95);
   }
 
-  // entropy của 15
-  const cntT = MC.filter(c => c === "T").length;
-  const pT15 = cntT / 15;
-  const pX15 = 1 - pT15;
-  const H = -(pT15 ? pT15 * Math.log2(pT15) : 0) - (pX15 ? pX15 * Math.log2(pX15) : 0);
-  let confBoost = H < 0.85 ? 0.08 : 0; // thiên lệch → tự tin hơn 1 chút
+  // Entropy động
+  const windows = [10, 15, 20];
+  let entropyAvg = 0;
+  windows.forEach((w) => {
+    const subSeq = seq.slice(-w);
+    const cntT = subSeq.filter((c) => c === "T").length;
+    const pT_w = cntT / w;
+    const pX_w = 1 - pT_w;
+    const H = -(pT_w ? pT_w * Math.log2(pT_w) : 0) - (pX_w ? pX_w * Math.log2(pX_w) : 0);
+    entropyAvg += H / windows.length;
+  });
 
+  const confBoost = entropyAvg < 0.8 ? 0.12 : 0;
   const pred = pT >= 0.5 ? "Tài" : "Xỉu";
-  const conf = clamp(0.55 + Math.abs(pT - 0.5) * 0.9 + confBoost, 0.52, 0.96);
+  const conf = clamp(0.62 + Math.abs(pT - 0.5) * 0.95 + confBoost, 0.6, 0.95);
 
-  return { pred, conf, note: used ? `Mau_cau15: ${used}, pT=${r01(pT)}` : `Mau_cau15: pT=${r01(pT)}` };
+  return { pred, conf, note: used ? `Mau_cau15: ${used}, pT=${r01(pT)}, runs=${runs.length}, stair=${stair}` : `Mau_cau15: pT=${r01(pT)}` };
 }
 
-// ============= AI phân tích cầu PRO (full nâng cao) =============
+// ============= AI phân tích cầu PRO (Siêu cải tiến) =============
 function aiProAnalyzer(hist) {
   if (hist.length < 7) return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", reason: "Thiếu dữ liệu" };
 
   const { streak, current } = detectStreak(hist);
   const bprob = breakProbability(hist);
-  const { avg, varc } = totalsStats(hist, 14);
-  const last8 = hist.slice(-8).map(x => x.result);
+  const { avg, varc } = totalsStats(hist, 15);
+  const last8 = hist.slice(-8).map((x) => x.result);
 
-  // detector “bậc thang”: ví dụ T,T,X,X,T,T → nghi nghiêng về đảo
   let stair = 0;
   for (let i = 2; i < last8.length; i++) {
     if (last8[i] === last8[i - 1] && last8[i - 2] !== last8[i - 1]) stair++;
   }
 
-  // alternating mạnh
   const sw8 = last8.slice(1).reduce((c, r, i) => c + (r !== last8[i] ? 1 : 0), 0);
 
   let scoreBreak = 0;
-  scoreBreak += (streak >= 7) ? 0.35 : (streak >= 5 ? 0.2 : 0.08);
-  scoreBreak += bprob * 0.6;
-  scoreBreak += (varc > 9 ? 0.1 : 0) + (stair >= 2 ? 0.06 : 0) + (sw8 >= 6 ? 0.05 : 0);
+  scoreBreak += streak >= 7 ? 0.45 : streak >= 5 ? 0.3 : streak >= 4 ? 0.2 : 0.12;
+  scoreBreak += bprob * 0.7;
+  scoreBreak += varc > 10 ? 0.15 : 0;
+  scoreBreak += stair >= 2 ? 0.1 : 0;
+  scoreBreak += sw8 >= 6 ? 0.08 : 0;
 
-  // drift quanh 10.5
-  if (avg > 10.8) scoreBreak += current === "Tài" ? -0.04 : 0.06;
-  if (avg < 10.2) scoreBreak += current === "Xỉu" ? -0.04 : 0.06;
+  if (avg > 11.2) scoreBreak += current === "Tài" ? -0.06 : 0.1;
+  if (avg < 9.8) scoreBreak += current === "Xỉu" ? -0.06 : 0.1;
 
-  scoreBreak = clamp(scoreBreak, 0, 0.95);
-  const pred = scoreBreak > 0.58 ? (current === "Tài" ? "Xỉu" : "Tài") : current;
+  scoreBreak = clamp(scoreBreak, 0, 0.96);
+  const pred = scoreBreak > 0.62 ? (current === "Tài" ? "Xỉu" : "Tài") : current;
 
   return {
     pred,
-    reason: `Streak=${streak}, BreakProb=${r01(bprob)}, avg=${r01(avg)}, var=${r01(varc)}, stair=${stair}, sw8=${sw8}`
+    reason: `Streak=${streak}, BreakProb=${r01(bprob)}, avg=${r01(avg)}, var=${r01(varc)}, stair=${stair}, sw8=${sw8}`,
   };
 }
 
-// ============= Các module phụ khác (giữ & tinh chỉnh) =============
-function trendWeighted(hist) {
-  if (hist.length < 6) return Math.random() < 0.5 ? "Tài" : "Xỉu";
-  const last20 = hist.slice(-20).map(x => x.result);
-  const w = last20.map((_, i) => Math.pow(1.25, i));
-  const tW = w.reduce((s, ww, i) => s + (last20[i] === "Tài" ? ww : 0), 0);
-  const xW = w.reduce((s, ww, i) => s + (last20[i] === "Xỉu" ? ww : 0), 0);
-  if (Math.abs(tW - xW) / (tW + xW) >= 0.28) return tW > xW ? "Tài" : "Xỉu";
-  return last20.at(-1) === "Tài" ? "Xỉu" : "Tài";
-}
-
-function shortPattern(hist) {
-  if (hist.length < 6) return Math.random() < 0.5 ? "Tài" : "Xỉu";
-  const last10 = hist.slice(-10).map(x => x.result);
-  const pc = {};
-  for (let i = 0; i <= last10.length - 4; i++) {
-    const k = last10.slice(i, i + 4).join(",");
-    pc[k] = (pc[k] || 0) + 1;
-  }
-  const top = Object.entries(pc).sort((a, b) => b[1] - a[1])[0];
-  if (top && top[1] >= 3) {
-    const end = last10.slice(-3).join(",");
-    // nếu 3 cuối của pattern khớp 3 cuối hiện tại → dự đoán phần tử tiếp theo của pattern
-    const parts = top[0].split(",");
-    if (end === parts.slice(0, 3).join(",")) return parts[3];
-  }
-  return last10.at(-1) === "Tài" ? "Xỉu" : "Tài";
-}
-
-function meanDeviation(hist) {
-  const last15 = hist.slice(-15).map(x => x.result);
-  if (last15.length < 8) return Math.random() < 0.5 ? "Tài" : "Xỉu";
-  const t = last15.filter(r => r === "Tài").length;
-  const x = last15.length - t;
-  if (Math.abs(t - x) / last15.length < 0.25) return last15.at(-1) === "Tài" ? "Xỉu" : "Tài";
-  return t > x ? "Xỉu" : "Tài";
-}
-
-function recentSwitch(hist) {
-  const last12 = hist.slice(-12).map(x => x.result);
-  if (last12.length < 6) return Math.random() < 0.5 ? "Tài" : "Xỉu";
-  const sw = last12.slice(1).reduce((c, r, i) => c + (r !== last12[i] ? 1 : 0), 0);
-  return sw >= 7 ? (last12.at(-1) === "Tài" ? "Xỉu" : "Tài")
-                 : (last12.at(-1) === "Tài" ? "Xỉu" : "Tài");
-}
-
-// ============= Mẫu cầu (n-gram lịch sử dài) =============
-function mauCauPredict() {
-  if (history.length < 8) return { pred: null, weight: 0, note: "Thiếu dài chuỗi" };
-  const seq = history.map(h => toTX(h.result));
-  const window = seq.slice(-5);
-  const tries = [
-    { n: 5, key: window.slice(-5).join("") },
-    { n: 4, key: window.slice(-4).join("") },
-    { n: 3, key: window.slice(-3).join("") },
-  ];
-  for (const t of tries) {
-    const mem = patternMemory[t.n]?.[t.key];
-    if (mem && (mem.T > 0 || mem.X > 0)) {
-      const predTX = mem.T === mem.X ? (Math.random() < 0.5 ? "T" : "X") : (mem.T > mem.X ? "T" : "X");
-      const conf = Math.max(mem.T, mem.X) / (mem.T + mem.X);
-      return { pred: fromTX(predTX), weight: 0.25 + conf * 0.25, note: `Mẫu ${t.n}-gram (${t.key}→${predTX})` };
-    }
-  }
-  return { pred: null, weight: 0.0, note: "Không khớp mẫu n-gram" };
-}
-
-// ============= Tự đánh giá hiệu năng để scale weight =============
-function evaluatePerformance(modelName, lookback = 18) {
-  const keys = Object.keys(modelPredictions).map(Number).sort((a, b) => a - b);
-  if (keys.length < 3) return 1;
-  const use = keys.slice(-lookback - 1);
-  let correct = 0, total = 0;
-  for (let i = 1; i < use.length; i++) {
-    const prev = use[i - 1];
-    const m = modelPredictions[prev];
-    const actual = history.find(h => h.session === prev)?.result;
-    if (!m || !actual) continue;
-    if (m[modelName] === actual) correct++;
-    total++;
-  }
-  if (!total) return 1;
-  const ratio = 1 + (correct - total / 2) / (total / 2);
-  return clamp(ratio, 0.6, 1.6);
-}
-
-function isBadPattern(hist) {
-  const last20 = hist.slice(-20).map(x => x.result);
-  const sw = last20.slice(1).reduce((c, r, i) => c + (r !== last20[i] ? 1 : 0), 0);
-  const { streak } = detectStreak(hist);
-  return sw >= 12 || streak >= 11;
-}
-
-// ============= Hợp nhất để ra dự đoán cuối =============
+// ============= Hợp nhất dự đoán (Ultimate VIP PRO) =============
 function finalPredict() {
   if (history.length === 0) {
     return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", conf: 0.5, explain: "Không có dữ liệu" };
   }
   const curSession = history.at(-1).session;
 
-  // module outputs
-  const tPred = trendWeighted(history);
-  const sPred = shortPattern(history);
-  const mPred = meanDeviation(history);
-  const swPred = recentSwitch(history);
+  // Module outputs
   const mk = markovTransition(history);
-  const brProb = breakProbability(history);
   const pro = aiProAnalyzer(history);
-  const mc = mauCauPredict();
-  const mc15 = mauCau15Predict(); // MỚI – dùng chuỗi 15 ký tự
+  const mc15 = mauCau15Predict();
+  const dice = diceAnalyzer(history);
 
-  // weights (có scale bằng hiệu năng)
-  const perf = (name, lb = 18) => evaluatePerformance(name, lb);
-  const weights = {
-    trend:  0.16 * perf("trend"),
-    short:  0.16 * perf("short"),
-    mean:   0.18 * perf("mean"),
-    switch: 0.14 * perf("switch"),
-    markov: 0.10 * perf("markov"),
-    proAI:  0.22 * perf("proAI"),
-    mau:    mc.weight || 0.18,
-    mau15:  0.24 * perf("mau15")
+  // Trọng số động
+  const weights = modelWeights;
+
+  let tai = 0,
+    xiu = 0;
+  const add = (p, w) => {
+    if (p === "Tài") tai += w;
+    else if (p === "Xỉu") xiu += w;
   };
 
-  // accumulate scores
-  let tai = 0, xiu = 0;
-  const add = (p, w) => { if (p === "Tài") tai += w; else if (p === "Xỉu") xiu += w; };
-
-  add(tPred, weights.trend);
-  add(sPred, weights.short);
-  add(mPred, weights.mean);
-  add(swPred, weights.switch);
   add(mk.pT >= 0.5 ? "Tài" : "Xỉu", weights.markov);
   add(pro.pred, weights.proAI);
-  if (mc.pred)  add(mc.pred, weights.mau);
   if (mc15.pred) add(mc15.pred, weights.mau15);
+  if (dice.pred) add(dice.pred, weights.dice);
 
-  // momentum gần 5 phiên
-  const last5 = history.slice(-5).map(x => x.result);
-  const mom = last5.filter(r => r === "Tài").length - last5.filter(r => r === "Xỉu").length;
-  if (mom > 1) tai += 0.08; else if (mom < -1) xiu += 0.08;
+  // Điều chỉnh mẫu cầu đặc biệt
+  const last20 = history.slice(-20).map((x) => x.result);
+  const sw = last20.slice(1).reduce((c, r, i) => c + (r !== last20[i] ? 1 : 0), 0);
+  const { streak, current } = detectStreak(history);
 
-  if (isBadPattern(history)) { tai *= 0.82; xiu *= 0.82; }
+  if (streak >= 5) {
+    const breakProb = clamp(0.75 + (streak - 5) * 0.06, 0.75, 0.92);
+    if (current === "Tài") xiu += breakProb * 0.35;
+    else tai += breakProb * 0.35;
+  }
+  if (sw >= 12) {
+    if (last20.at(-1) === "Tài") xiu += 0.25;
+    else tai += 0.25;
+  }
 
-  // điều chỉnh thiên lệch 15 phiên
-  const last15 = history.slice(-15).map(x => x.result);
-  const t15 = last15.filter(r => r === "Tài").length;
-  if (t15 >= 10) xiu += 0.12;
-  else if (t15 <= 5) tai += 0.12;
+  const last15 = history.slice(-15).map((x) => x.result);
+  const t15 = last15.filter((r) => r === "Tài").length;
+  if (t15 >= 11) xiu += 0.2;
+  else if (t15 <= 4) tai += 0.2;
 
   const pred = tai >= xiu ? "Tài" : "Xỉu";
   const margin = Math.abs(tai - xiu);
-  // conf dựa trên margin + các module xác suất
-  let conf = 0.55 + clamp(margin, 0, 0.9);
-  // ảnh hưởng của mau_cau-15 (có conf riêng)
-  conf = 0.6 * conf + 0.4 * (mc15.conf || 0.55);
-  // ảnh hưởng bẻ cầu
-  conf = pred === (history.at(-1).result === "Tài" ? "Xỉu" : "Tài")
-    ? conf + brProb * 0.05
-    : conf;
-  conf = clamp(conf, 0.52, 0.98);
+  let conf = 0.6 + clamp(margin, 0, 0.95);
+  conf = 0.5 * conf + 0.3 * (mc15.conf || 0.6) + 0.2 * (dice.conf || 0.6);
+  conf = clamp(conf, 0.6, 0.98);
 
-  // lưu cho tự chấm
+  // Phân tích mẫu cầu
+  const patternNote =
+    sw >= 12
+      ? "Cầu alternating mạnh"
+      : streak >= 5
+      ? `Cầu bệt (${streak} ${current})`
+      : stair >= 2
+      ? "Cầu bậc thang"
+      : "Cầu ngẫu nhiên";
+
+  // Lưu dự đoán
   if (!modelPredictions[curSession]) modelPredictions[curSession] = {};
   modelPredictions[curSession] = {
-    trend: tPred,
-    short: sPred,
-    mean: mPred,
-    switch: swPred,
     markov: mk.pT >= 0.5 ? "Tài" : "Xỉu",
     proAI: pro.pred,
-    mau: mc.pred || "None",
     mau15: mc15.pred || "None",
-    final: pred
+    dice: dice.pred || "None",
+    final: pred,
   };
-  
-  // Ghi lại lịch sử dự đoán mới
+
   const latestPrediction = {
     Phien_truoc: curSession,
     Du_doan: pred,
     Ket_qua: history.at(-1).result,
     Do_tin_cay: r01(conf),
-    Danh_gia: pred === history.at(-1).result ? "ĐÚNG✅" : "SAI❌"
+    Danh_gia: pred === history.at(-1).result ? "ĐÚNG✅" : "SAI❌",
   };
 
-  const seen = new Set(predictionsHistory.map(p => p.Phien_truoc));
+  const seen = new Set(predictionsHistory.map((p) => p.Phien_truoc));
   if (!seen.has(curSession)) {
     predictionsHistory.push(latestPrediction);
     if (predictionsHistory.length > MAX_PREDICTIONS_HISTORY) {
-        predictionsHistory = predictionsHistory.slice(-MAX_PREDICTIONS_HISTORY);
+      predictionsHistory = predictionsHistory.slice(-MAX_PREDICTIONS_HISTORY);
     }
   }
 
   const explain = [
     `PRO(${pro.reason})`,
     `Markov pT=${r01(mk.pT)}`,
-    `BreakProb=${r01(brProb)}`,
-    `Mẫu_cầu=${mc.note}`,
+    `BreakProb=${r01(breakProbability(history))}`,
     `Mau_cau15=${mc15.note}; conf15=${r01(mc15.conf)}`,
-    `Điểm T=${r01(tai)} · X=${r01(xiu)} · margin=${r01(margin)}`
+    `Dice=${dice.note}`,
+    `Pattern=${patternNote}`,
+    `Điểm T=${r01(tai)} · X=${r01(xiu)} · margin=${r01(margin)}`,
+    `Weights=${JSON.stringify(modelWeights)}`,
   ].join(" | ");
 
   return { pred, conf: r01(conf), explain };
 }
 
+// ============= Tự động làm mới dữ liệu =============
+setInterval(loadSource, 5 * 60 * 1000); // Làm mới mỗi 5 phút
+
 // ============= Endpoint chính =============
-app.get("/api/custom", async (_req, res) => {
+app.get("/api/predict", async (_req, res) => {
   try {
     await loadSource();
 
@@ -444,10 +432,7 @@ app.get("/api/custom", async (_req, res) => {
 
     const latest = history.at(-1);
     const { session, dice, total, result } = latest;
-
-    // Chuỗi Mau_cau 20 phiên gần nhất (giữ nguyên kiểu cũ)
-    const Mau_cau = history.slice(-20).map(h => toTX(h.result)).join("");
-
+    const Mau_cau = history.slice(-20).map((h) => toTX(h.result)).join("");
     const { pred, conf, explain } = finalPredict();
 
     res.json({
@@ -460,7 +445,7 @@ app.get("/api/custom", async (_req, res) => {
       Du_doan: pred,
       Do_tin_cay: conf,
       Giai_thich: explain,
-      Mau_cau
+      Mau_cau,
     });
   } catch (err) {
     res.status(500).json({ error: "Lỗi xử lý", detail: err.message });
@@ -468,18 +453,16 @@ app.get("/api/custom", async (_req, res) => {
 });
 
 // ============= Debug/Health =============
-app.get("/", (_req, res) => res.send("Taixiu SIÊU VIP API ok. Use /api/custom"));
+app.get("/", (_req, res) => res.send("Taixiu ULTIMATE VIP PRO API ok. Use /api/predict"));
 app.get("/debug/history", (_req, res) => res.json(history.slice(-80)));
 app.get("/debug/pattern", (_req, res) => res.json(patternMemory));
 app.get("/debug/predict_modules", (_req, res) => {
   const cur = history.at(-1)?.session;
   res.json({ session: cur, modules: modelPredictions[cur] || null });
 });
-// Endpoint mới
-app.get("/debug/lichsu-dudoan", (_req, res) => {
-  res.json(predictionsHistory);
-});
+app.get("/debug/lichsu-dudoan", (_req, res) => res.json(predictionsHistory));
+app.get("/debug/weights", (_req, res) => res.json(modelWeights));
 
 app.listen(PORT, () => {
-  console.log(`✅ API chạy: http://localhost:${PORT}/api/custom`);
+  console.log(`✅ API chạy: http://localhost:${PORT}/api/predict`);
 });
