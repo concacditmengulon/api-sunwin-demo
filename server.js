@@ -4,10 +4,10 @@
  * Endpoint chính: GET /api/custom
  * Trả về:
  * {
- *   id: "Tele@idol_vannhat",
- *   Phien_truoc, Phien_sau,
- *   Xuc_xac: [x1,x2,x3],
- *   Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
+ * id: "Tele@idol_vannhat",
+ * Phien_truoc, Phien_sau,
+ * Xuc_xac: [x1,x2,x3],
+ * Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
  * }
  */
 
@@ -392,8 +392,13 @@ app.get("/api/custom", async (req, res) => {
     const latest = history.at(-1);
     const { session, dice, total, result } = latest;
 
-    // Mau_cau: 1 phiên lưu 1 ký tự theo kết quả phiên đó
-    const Mau_cau = result === "Tài" ? "T" : "X";
+    // Lấy chuỗi kết quả của 20 phiên gần nhất
+    const mauCauHistory = history
+      .slice(-20) // Lấy 20 phiên cuối cùng
+      .map(h => toTX(h.result)); // Chuyển "Tài" thành "T", "Xỉu" thành "X"
+    
+    // Nối các ký tự lại thành một chuỗi
+    const Mau_cau = mauCauHistory.join("");
 
     // Dự đoán cho PHIÊN SAU
     const { pred, conf, explain } = finalPredict();
