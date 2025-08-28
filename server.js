@@ -1,39 +1,29 @@
-/**
- * API Taixiu ULTIMATE VIP PRO v2 – by Tele@idol_vannhat
- * Node >= 18 (có fetch sẵn)
- * Endpoint: GET /api/predict
- * Trả về:
- * {
- * id: "Tele@idol_vannhat",
- * Phien_truoc, Phien_sau, Xuc_xac, Tong, Ket_qua, Du_doan, Do_tin_cay, Giai_thich, Mau_cau
- * }
- */
-
-import express from "express";
-
+// server.js
+const express = require('express');
+const fetch = require('node-fetch');
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; // Render sử dụng process.env.PORT
 
-// ============= Cấu hình nguồn dữ liệu =============
+// Cấu hình nguồn dữ liệu
 const SOURCE_API = "https://sunai.onrender.com/api/taixiu/history";
 
-// ============= Bộ nhớ trong server =============
-let history = []; // [{session, dice:[a,b,c], total, result}]
-let patternMemory = {}; // n-gram 'T'/'X' -> tần suất tiếp theo
-let modelPredictions = {}; // {session: {module: "Tài"/"Xỉu", ... , final}}
-let predictionsHistory = []; // {session, du_doan, ket_qua, do_tin_cay, danh_gia}
-let modelWeights = { markov: 0.15, proAI: 0.25, mau15: 0.35, dice: 0.25 }; // Trọng số khởi tạo
-const MAX_HISTORY = 300; // Giảm để tối ưu bộ nhớ
+// Bộ nhớ trong server
+let history = [];
+let patternMemory = {};
+let modelPredictions = {};
+let predictionsHistory = [];
+let modelWeights = { markov: 0.15, proAI: 0.25, mau15: 0.35, dice: 0.25 };
+const MAX_HISTORY = 300;
 const MAX_PREDICTIONS_HISTORY = 150;
 
-// ============= Tiện ích chung =============
+// Tiện ích chung
 const r01 = (x) => Math.round(x * 100) / 100;
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const last = (arr, k = 1) => arr.slice(-k);
 const toTX = (res) => (res === "Tài" ? "T" : "X");
 const fromTX = (c) => (c === "T" ? "Tài" : "Xỉu");
 
-// ============= Nạp & chuẩn hoá dữ liệu =============
+// Nạp & chuẩn hoá dữ liệu
 async function loadSource() {
   try {
     const resp = await fetch(SOURCE_API, { cache: "no-store" });
@@ -56,7 +46,7 @@ async function loadSource() {
     if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
 
     rebuildPatternMemory();
-    updateModelWeights(); // Cập nhật trọng số sau khi nạp dữ liệu
+    updateModelWeights();
   } catch (err) {
     console.error("Lỗi loadSource:", err.message);
   }
@@ -78,7 +68,6 @@ function rebuildPatternMemory() {
   }
 }
 
-// ============= Tự động cập nhật trọng số (Logistic Regression đơn giản) =============
 function updateModelWeights(lookback = 50) {
   const keys = Object.keys(modelPredictions).map(Number).sort((a, b) => a - b);
   if (keys.length < 10) return;
@@ -100,20 +89,18 @@ function updateModelWeights(lookback = 50) {
   }
 
   if (total === 0) return;
-  const learningRate = 0.05;
+  const learning_rate = 0.05;
   models.forEach((model) => {
     const accuracy = correct[model] / total;
-    modelWeights[model] = clamp(modelWeights[model] + learningRate * (accuracy - 0.5), 0.1, 0.4);
+    modelWeights[model] = clamp(modelWeights[model] + learning_rate * (accuracy - 0.5), 0.1, 0.4);
   });
 
-  // Chuẩn hóa trọng số
   const sum = Object.values(modelWeights).reduce((s, w) => s + w, 0);
   models.forEach((model) => {
     modelWeights[model] = r01(modelWeights[model] / sum);
   });
 }
 
-// ============= Phân tích nền tảng =============
 function detectStreak(hist) {
   if (hist.length === 0) return { streak: 0, current: null };
   const current = hist.at(-1).result;
@@ -159,7 +146,6 @@ function totalsStats(hist, k = 15) {
   return { avg, varc };
 }
 
-// ============= Phân tích xúc xắc (Nâng cao) =============
 function diceAnalyzer(hist, k = 15) {
   if (hist.length < k) return { pred: null, conf: 0.5, note: "Thiếu dữ liệu xúc xắc" };
 
@@ -172,11 +158,10 @@ function diceAnalyzer(hist, k = 15) {
   const highFreq = (freq[5] + freq[6]) / (k * 3);
   const lowFreq = (freq[1] + freq[2]) / (k * 3);
 
-  // Phát hiện cặp xúc xắc lặp lại
   const pairs = {};
   recent.forEach((h) => {
     const key = h.dice.sort().join(",");
-    pairs[key] = (pairs[key] || 0) + 1;
+    pairs[key] = ( pairs[key] || 0) + 1;
   });
   const topPair = Object.entries(pairs).sort((a, b) => b[1] - a[1])[0];
   const pairBoost = topPair && topPair[1] >= 3 ? 0.1 : 0;
@@ -195,7 +180,6 @@ function diceAnalyzer(hist, k = 15) {
   };
 }
 
-// ============= Phân tích Mau_cau-15 (Siêu cải tiến) =============
 function mauCau15Predict() {
   if (history.length < 16) return { pred: null, conf: 0.0, note: "Thiếu lịch sử" };
 
@@ -220,7 +204,6 @@ function mauCau15Predict() {
     }
   }
 
-  // Phân tích cấu trúc cầu
   let r = 1,
     lastC = MC[0],
     maxR = 1,
@@ -243,7 +226,6 @@ function mauCau15Predict() {
     pT = lastChar === "T" ? clamp(pT - 0.2, 0.05, 0.95) : clamp(pT + 0.2, 0.05, 0.95);
   }
 
-  // Phát hiện mẫu bậc thang
   let stair = 0;
   const last8 = seq.slice(-8);
   if (last8.length >= 8) {
@@ -262,7 +244,6 @@ function mauCau15Predict() {
     pT = lastChar === "T" ? clamp(pT - 0.15, 0.05, 0.95) : clamp(pT + 0.15, 0.05, 0.95);
   }
 
-  // Entropy động
   const windows = [10, 15, 20];
   let entropyAvg = 0;
   windows.forEach((w) => {
@@ -283,7 +264,6 @@ function mauCau15Predict() {
   return { pred, conf, note: used ? `Mau_cau15: ${used}, pT=${r01(pT)}, runs=${runs.length}, stair=${stair}` : `Mau_cau15: pT=${r01(pT)}` };
 }
 
-// ============= AI phân tích cầu PRO (Siêu cải tiến) =============
 function aiProAnalyzer(hist) {
   if (hist.length < 7) return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", reason: "Thiếu dữ liệu" };
 
@@ -320,20 +300,17 @@ function aiProAnalyzer(hist) {
   };
 }
 
-// ============= Hợp nhất dự đoán (Ultimate VIP PRO v2) =============
 function finalPredict() {
   if (history.length === 0) {
     return { pred: Math.random() < 0.5 ? "Tài" : "Xỉu", conf: 0.5, explain: "Không có dữ liệu" };
   }
   const curSession = history.at(-1).session;
 
-  // Module outputs
   const mk = markovTransition(history);
   const pro = aiProAnalyzer(history);
   const mc15 = mauCau15Predict();
   const dice = diceAnalyzer(history);
 
-  // Khai báo biến `stair` ở đầu hàm
   let stair = 0;
   const last8 = history.slice(-8).map((x) => x.result);
   if (last8.length >= 3) {
@@ -342,7 +319,6 @@ function finalPredict() {
     }
   }
 
-  // Trọng số động
   const weights = modelWeights;
 
   let tai = 0,
@@ -357,7 +333,6 @@ function finalPredict() {
   if (mc15.pred) add(mc15.pred, weights.mau15);
   if (dice.pred) add(dice.pred, weights.dice);
 
-  // Điều chỉnh mẫu cầu đặc biệt
   const last20 = history.slice(-20).map((x) => x.result);
   const sw = last20.slice(1).reduce((c, r, i) => c + (r !== last20[i] ? 1 : 0), 0);
   const { streak, current } = detectStreak(history);
@@ -383,7 +358,6 @@ function finalPredict() {
   conf = 0.5 * conf + 0.3 * (mc15.conf || 0.6) + 0.2 * (dice.conf || 0.6);
   conf = clamp(conf, 0.6, 0.98);
 
-  // Phân tích mẫu cầu
   const patternNote =
     sw >= 12
       ? "Cầu alternating mạnh"
@@ -393,7 +367,6 @@ function finalPredict() {
       ? "Cầu bậc thang"
       : "Cầu ngẫu nhiên";
 
-  // Lưu dự đoán
   if (!modelPredictions[curSession]) modelPredictions[curSession] = {};
   modelPredictions[curSession] = {
     markov: mk.pT >= 0.5 ? "Tài" : "Xỉu",
@@ -433,10 +406,10 @@ function finalPredict() {
   return { pred, conf: r01(conf), explain };
 }
 
-// ============= Tự động làm mới dữ liệu =============
-setInterval(loadSource, 5 * 60 * 1000); // Làm mới mỗi 5 phút
+// Tự động làm mới dữ liệu mỗi 5 phút
+setInterval(loadSource, 5 * 60 * 1000);
 
-// ============= Endpoint chính =============
+// Endpoint chính
 app.get("/api/predict", async (_req, res) => {
   try {
     await loadSource();
@@ -467,7 +440,7 @@ app.get("/api/predict", async (_req, res) => {
   }
 });
 
-// ============= Debug/Health =============
+// Debug endpoints
 app.get("/", (_req, res) => res.send("Taixiu ULTIMATE VIP PRO v2 API ok. Use /api/predict"));
 app.get("/debug/history", (_req, res) => res.json(history.slice(-80)));
 app.get("/debug/pattern", (_req, res) => res.json(patternMemory));
@@ -478,6 +451,11 @@ app.get("/debug/predict_modules", (_req, res) => {
 app.get("/debug/lichsu-dudoan", (_req, res) => res.json(predictionsHistory));
 app.get("/debug/weights", (_req, res) => res.json(modelWeights));
 
+// Health check endpoint cho Render
+app.get("/health", (_req, res) => res.status(200).json({ status: "OK" }));
+
+// Start server
 app.listen(PORT, () => {
   console.log(`✅ API chạy: http://localhost:${PORT}/api/predict`);
+  loadSource(); // Load dữ liệu ngay khi start
 });
